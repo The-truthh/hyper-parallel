@@ -21,6 +21,7 @@ import torch
 from torch.nn import functional
 
 from hyper_parallel.components.losses import _vocab_parallel_cross_entropy as loss_module
+from tests.common.mark_utils import arg_mark
 
 
 def _mesh(size: int = 1, rank: int = 0) -> Mock:
@@ -46,7 +47,7 @@ class TestVocabParallelCrossEntropy(unittest.TestCase):
         logits = torch.randn(4, 5, generator=torch.Generator().manual_seed(17), dtype=torch.float64)
         local_logits = logits.clone().requires_grad_()
         reference_logits = logits.clone().requires_grad_()
-        with patch.object(loss_module, "_differentiable_all_reduce", side_effect=_identity_reduce):
+        with patch.object(loss_module, "_eager_all_reduce", side_effect=_identity_reduce):
             actual = loss_module.DistributedCrossEntropyFunction.apply(
                 local_logits, target, weight, -100, reduction, 5, _mesh(), 0,
             )
@@ -58,64 +59,118 @@ class TestVocabParallelCrossEntropy(unittest.TestCase):
         reference.backward(scale.reshape(reference.shape))
         torch.testing.assert_close(local_logits.grad, reference_logits.grad, equal_nan=True)
 
+    @arg_mark(
+        plat_marks=["cpu_linux", "cpu_macos"],
+        level_mark="level0",
+        card_mark="onecard",
+        essential_mark="essential",
+    )
     def test_all_reductions_and_class_weights(self) -> None:
-        """Preserve ignored targets, weighted normalization, and upstream gradient scaling."""
+        """Preserve loss semantics across reductions and class weights.
+
+        Feature: Single-rank vocab-parallel cross entropy.
+        Description: Compare every reduction with and without class weights against PyTorch.
+        Expectation: Loss values and scaled gradients match native cross entropy.
+        """
         target = torch.tensor([0, -100, 4, 2])
         for reduction in ("none", "sum", "mean"):
             for weight in (None, torch.tensor([0.5, 1.0, 2.0, 3.0, 1.5], dtype=torch.float64)):
                 with self.subTest(reduction=reduction, weighted=weight is not None):
                     self._check_single_rank(target, weight, reduction)
 
+    @arg_mark(
+        plat_marks=["cpu_linux", "cpu_macos"],
+        level_mark="level0",
+        card_mark="onecard",
+        essential_mark="essential",
+    )
     def test_all_ignored_targets(self) -> None:
-        """Match PyTorch's zero gradients and NaN mean for an entirely ignored batch."""
+        """Match native behavior when every target is ignored.
+
+        Feature: Ignored targets in vocab-parallel cross entropy.
+        Description: Compute every reduction for a batch containing only ignored targets.
+        Expectation: Gradients are zero and the mean loss is NaN, matching PyTorch.
+        """
         for reduction in ("none", "sum", "mean"):
             with self.subTest(reduction=reduction):
                 self._check_single_rank(torch.full((4,), -100), None, reduction)
 
+    @arg_mark(
+        plat_marks=["cpu_linux", "cpu_macos"],
+        level_mark="level0",
+        card_mark="onecard",
+        essential_mark="essential",
+    )
     def test_uneven_vocab_shards_match_reference_gradients(self) -> None:
-        """Respect nonzero shard offsets and the shorter final vocab shard."""
+        """Respect nonzero offsets and an uneven final vocabulary shard.
+
+        Feature: Uneven vocab-parallel shards.
+        Description: Emulate two ranks for a vocabulary that cannot divide evenly.
+        Expectation: Every rank sees the global loss and its gradient matches its shard.
+        """
         logits = torch.randn(4, 5, generator=torch.Generator().manual_seed(23), dtype=torch.float64)
         target = torch.tensor([0, -100, 4, 2])
         reference_logits = logits.clone().requires_grad_()
         reference = functional.cross_entropy(reference_logits, target, reduction="sum")
         (reference * 0.7).backward()
         maximum = logits.max(dim=-1, keepdim=True).values
-        exp_sum = (logits - maximum).exp().sum(dim=-1, keepdim=True)
+        shifted_logits = logits - maximum
+        exp_sum = shifted_logits.exp().sum(dim=-1, keepdim=True)
+        valid_mask = target != -100
+        safe_target = torch.where(valid_mask, target, torch.zeros_like(target))
+        rows = torch.arange(target.numel())
+        predicted_logits = shifted_logits[rows, safe_target] * valid_mask
         local_losses = []
 
         for rank, shard in enumerate(logits.chunk(2, dim=-1)):
             with self.subTest(rank=rank):
                 local_logits = shard.clone().requires_grad_()
                 with patch.object(
-                    loss_module, "_differentiable_all_reduce",
-                    side_effect=[maximum, exp_sum, reference.detach().reshape(1)],
-                ) as reduce_mock:
+                    loss_module,
+                    "_eager_all_reduce",
+                    side_effect=[maximum, predicted_logits, exp_sum],
+                ):
                     loss = loss_module.vocab_parallel_cross_entropy_local(
                         local_logits, target, vocab_size=5, mesh=_mesh(2, rank), reduction="sum",
                     )
-                local_losses.append(reduce_mock.call_args_list[2].args[0])
+                local_losses.append(loss.detach())
                 # Custom autograd installs its backward even when the mocked
                 # collective returns a tensor detached from the local logits.
                 self.assertTrue(loss.requires_grad)
                 self.assertIsNotNone(loss.grad_fn)
                 (loss * 0.7).backward()
                 torch.testing.assert_close(local_logits.grad, reference_logits.grad.chunk(2, dim=-1)[rank])
-        torch.testing.assert_close(sum(local_losses).reshape(()), reference)
+        for local_loss in local_losses:
+            torch.testing.assert_close(local_loss.reshape(()), reference)
 
+    @arg_mark(
+        plat_marks=["cpu_linux", "cpu_macos"],
+        level_mark="level0",
+        card_mark="onecard",
+        essential_mark="essential",
+    )
     def test_rank_without_targets_still_receives_softmax_gradient(self) -> None:
-        """Keep remote-target contributions on a shard with no locally selected classes."""
+        """Keep gradients on a rank that owns none of the selected classes.
+
+        Feature: Remote targets in vocab-parallel cross entropy.
+        Description: Place the target on one shard and evaluate the other vocabulary shard.
+        Expectation: The remote shard receives the same softmax gradient as full PyTorch.
+        """
         logits = torch.tensor([[0.1, -0.2, 0.4, 0.3, 0.6]], dtype=torch.float64, requires_grad=True)
         target = torch.tensor([0])
         reference = functional.cross_entropy(logits, target, reduction="sum")
         reference.backward()
         local_logits = logits.detach()[:, 3:].clone().requires_grad_()
         maximum = logits.detach().max(dim=-1, keepdim=True).values
+        shifted_logits = logits.detach() - maximum
+        predicted_logits = shifted_logits[:, 0]
         with patch.object(
-            loss_module, "_differentiable_all_reduce",
+            loss_module,
+            "_eager_all_reduce",
             side_effect=[
                 maximum,
-                (logits.detach() - maximum).exp().sum(-1, keepdim=True),
-                reference.detach().reshape(1),
+                predicted_logits,
+                shifted_logits.exp().sum(-1, keepdim=True),
             ],
         ):
             loss = loss_module.vocab_parallel_cross_entropy_local(
